@@ -69,6 +69,9 @@ jobs:
           echo "Workspace: $WORKSPACE | Scheme: $SCHEME"
 
       - name: Archive unsigned
+        env:
+          SENTRY_DISABLE_AUTO_UPLOAD: 'true'
+          SENTRY_ALLOW_FAILURE: 'true'
         run: |
           set -o pipefail
           mkdir -p build
