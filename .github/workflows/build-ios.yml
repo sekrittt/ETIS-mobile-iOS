@@ -1,0 +1,113 @@
+name: Build iOS IPA (unsigned)
+
+# Запуск вручную: вкладка Actions → "Build iOS IPA (unsigned)" → Run workflow → ветка feat/ios.
+# Аккаунт Apple не нужен: сборка идёт без подписи (CODE_SIGNING_ALLOWED=NO),
+# подпись бесплатным Apple ID выполняет iLoader/SideStore уже на твоей машине.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Archive → unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Xcode info
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      # node нужен для фазы "Bundle React Native code and images" внутри xcodebuild
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install JS dependencies (bun)
+        run: bun install --frozen-lockfile
+
+      # ios/ в репо нет — генерируем нативный проект из app.config.js.
+      # --no-install: pod install делаем отдельным шагом, чтобы логи были разделены.
+      - name: Expo prebuild (генерация ios/)
+        env:
+          EXPO_NO_TELEMETRY: 1
+        run: npx --no-install expo prebuild -p ios --clean --no-install
+
+      - name: CocoaPods
+        run: |
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods -N
+          fi
+          cd ios
+          pod install
+
+      # Схему и workspace определяем автоматически, чтобы не зависеть от имени проекта.
+      - name: Detect workspace & scheme
+        id: detect
+        run: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -n 1)
+          [ -n "$WORKSPACE" ] || { echo "xcworkspace not found in ios/"; exit 1; }
+          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json | jq -r '.workspace.schemes[]' | grep -vi '^Pods' | head -n 1)
+          [ -n "$SCHEME" ] || { echo "scheme not found"; exit 1; }
+          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Workspace: $WORKSPACE | Scheme: $SCHEME"
+
+      - name: Archive unsigned
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild \
+            -workspace "${{ steps.detect.outputs.workspace }}" \
+            -scheme "${{ steps.detect.outputs.scheme }}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/etis.xcarchive \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build/xcodebuild.log
+
+      # Из архива берём .app → кладём в Payload/ → zip = .ipa без подписи.
+      - name: Package .ipa
+        run: |
+          APP_PATH=$(find build/etis.xcarchive/Products/Applications -maxdepth 1 -type d -name '*.app' | head -n 1)
+          [ -n "$APP_PATH" ] || { echo ".app not found in archive"; exit 1; }
+          echo "App: $APP_PATH"
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          cd build
+          zip -qry "etis-mobile-${{ github.run_number }}.ipa" Payload
+          ls -lh "etis-mobile-${{ github.run_number }}.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: etis-mobile-unsigned-${{ github.run_number }}
+          path: build/etis-mobile-*.ipa
+          if-no-files-found: error
+
+      # Лог сборки — на случай, если первый запуск упадёт и надо будет разбираться.
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ github.run_number }}
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
